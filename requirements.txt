@@ -1,0 +1,7 @@
+# Core dependencies
+pyperclip>=1.8.2      # Cross-platform text clipboard
+Pillow>=10.0.0        # Image clipboard support
+rich>=13.0.0          # Terminal UI
+
+# Windows-only (for rich clipboard: HTML, RTF, files)
+pywin32>=306; sys_platform == 'win32'
