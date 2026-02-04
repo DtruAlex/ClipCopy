@@ -118,17 +118,26 @@ DS_ClipCopy/
 3. Agent encrypts data with room key
 4. Agent sends to Hub with room name
 5. Hub broadcasts to all other clients in that room
-6. Device B's agent receives, decrypts, and sets local clipboard
+6. Device B's agent receives, decrypts, verifies authentication, and sets local clipboard
 7. You can now paste on Device B (Ctrl+V)
 
-## Security Notes
+## Security Features
 
-⚠️ **Important:**
+✅ **Production-Grade Security:**
 
-- Current encryption is XOR-based (obfuscation, not cryptographic security)
+- **AES-256-GCM Encryption**: Industry-standard authenticated encryption (AEAD)
+- **Authentication Tags**: 16-byte tags prevent tampering - any modification causes immediate failure
+- **Key Derivation**: SHA-256 hashing of room passwords to 256-bit keys
+- **Random Nonces**: 96-bit unique nonces per message prevent replay attacks
+- **Pure Binary Protocol**: Efficient struct.pack serialization (no JSON overhead)
+- **Per-Room Keys**: Independent encryption for each room
+
+⚠️ **Security Considerations:**
+
 - Only join rooms you trust - clipboard can contain sensitive data
-- For production use, upgrade to AES-256 encryption
-- Hub should be on a trusted network
+- Use strong room passwords (≥12 characters, mixed case, numbers, symbols)
+- Hub sees encrypted traffic but cannot decrypt without room keys
+- Hub should be on a trusted network (or use VPN)
 
 ## Troubleshooting
 
@@ -136,6 +145,10 @@ DS_ClipCopy/
 - Make sure ClipHub.py is running
 - Check firewall allows port 9999
 - Verify --host and --port match the hub
+
+### "Decrypt failed" errors
+- Verify all clients in room use the same password
+- Authentication failure means data was tampered or wrong key
 
 ### "pyperclip not found"
 ```bash

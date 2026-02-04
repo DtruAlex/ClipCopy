@@ -1,10 +1,11 @@
 """
 Cross-platform rich clipboard handler.
 Supports text, images, HTML, and detects clipboard changes.
+Uses PURE BINARY serialization (no JSON).
 """
 import hashlib
 import io
-import json
+import struct
 import platform
 from typing import Dict, Optional, List
 from dataclasses import dataclass
@@ -48,30 +49,145 @@ class ClipboardData:
     files: Optional[List[str]] = None
 
     def to_bytes(self) -> bytes:
-        """Serialize clipboard data to JSON bytes"""
-        data = {
-            'text': self.text,
-            'html': self.html,
-            'image': self.image.hex() if self.image else None,
-            'rtf': self.rtf,
-            'files': self.files
-        }
-        return json.dumps(data, ensure_ascii=False).encode('utf-8')
+        """
+        Serialize clipboard data to PURE BINARY format (no JSON).
+
+        Binary Format:
+        [1 byte flags][conditional segments with length prefixes]
+
+        Flags (8 bits):
+        - bit 0: has_text
+        - bit 1: has_html
+        - bit 2: has_image
+        - bit 3: has_rtf
+        - bit 4: has_files
+        """
+        # Calculate presence flags
+        flags = 0
+        if self.text:  flags |= 0x01
+        if self.html:  flags |= 0x02
+        if self.image: flags |= 0x04
+        if self.rtf:   flags |= 0x08
+        if self.files: flags |= 0x10
+
+        # Build binary payload
+        segments = [struct.pack('B', flags)]
+
+        # Text segment: [4 bytes length][UTF-8 bytes]
+        if self.text:
+            text_bytes = self.text.encode('utf-8')
+            segments.append(struct.pack('!I', len(text_bytes)))
+            segments.append(text_bytes)
+
+        # HTML segment: [4 bytes length][UTF-8 bytes]
+        if self.html:
+            html_bytes = self.html.encode('utf-8')
+            segments.append(struct.pack('!I', len(html_bytes)))
+            segments.append(html_bytes)
+
+        # Image segment: [4 bytes length][raw PNG bytes]
+        if self.image:
+            segments.append(struct.pack('!I', len(self.image)))
+            segments.append(self.image)
+
+        # RTF segment: [4 bytes length][UTF-8 bytes]
+        if self.rtf:
+            rtf_bytes = self.rtf.encode('utf-8')
+            segments.append(struct.pack('!I', len(rtf_bytes)))
+            segments.append(rtf_bytes)
+
+        # Files segment: [1 byte count][per file: 2 bytes length + UTF-8 path]
+        if self.files:
+            segments.append(struct.pack('B', min(len(self.files), 255)))
+            for filepath in self.files[:255]:  # Max 255 files
+                file_bytes = filepath.encode('utf-8')
+                # Truncate path if > 65535 bytes
+                if len(file_bytes) > 65535:
+                    file_bytes = file_bytes[:65535]
+                segments.append(struct.pack('!H', len(file_bytes)))
+                segments.append(file_bytes)
+
+        return b''.join(segments)
 
     @staticmethod
     def from_bytes(data: bytes) -> 'ClipboardData':
-        """Deserialize clipboard data from JSON bytes"""
+        """Deserialize clipboard data from PURE BINARY format"""
         try:
-            obj = json.loads(data.decode('utf-8'))
-            return ClipboardData(
-                text=obj.get('text'),
-                html=obj.get('html'),
-                image=bytes.fromhex(obj['image']) if obj.get('image') else None,
-                rtf=obj.get('rtf'),
-                files=obj.get('files')
-            )
+            if not data or len(data) < 1:
+                return ClipboardData()
+
+            pos = 0
+            flags = data[pos]
+            pos += 1
+
+            result = ClipboardData()
+
+            # Parse text (bit 0)
+            if flags & 0x01:
+                if pos + 4 > len(data):
+                    return result
+                length = struct.unpack('!I', data[pos:pos+4])[0]
+                pos += 4
+                if pos + length > len(data):
+                    return result
+                result.text = data[pos:pos+length].decode('utf-8', errors='replace')
+                pos += length
+
+            # Parse HTML (bit 1)
+            if flags & 0x02:
+                if pos + 4 > len(data):
+                    return result
+                length = struct.unpack('!I', data[pos:pos+4])[0]
+                pos += 4
+                if pos + length > len(data):
+                    return result
+                result.html = data[pos:pos+length].decode('utf-8', errors='replace')
+                pos += length
+
+            # Parse image (bit 2)
+            if flags & 0x04:
+                if pos + 4 > len(data):
+                    return result
+                length = struct.unpack('!I', data[pos:pos+4])[0]
+                pos += 4
+                if pos + length > len(data):
+                    return result
+                result.image = data[pos:pos+length]
+                pos += length
+
+            # Parse RTF (bit 3)
+            if flags & 0x08:
+                if pos + 4 > len(data):
+                    return result
+                length = struct.unpack('!I', data[pos:pos+4])[0]
+                pos += 4
+                if pos + length > len(data):
+                    return result
+                result.rtf = data[pos:pos+length].decode('utf-8', errors='replace')
+                pos += length
+
+            # Parse files (bit 4)
+            if flags & 0x10:
+                if pos + 1 > len(data):
+                    return result
+                file_count = data[pos]
+                pos += 1
+                result.files = []
+                for _ in range(file_count):
+                    if pos + 2 > len(data):
+                        break
+                    length = struct.unpack('!H', data[pos:pos+2])[0]
+                    pos += 2
+                    if pos + length > len(data):
+                        break
+                    filepath = data[pos:pos+length].decode('utf-8', errors='replace')
+                    pos += length
+                    result.files.append(filepath)
+
+            return result
+
         except Exception as e:
-            print(f"[!] Failed to deserialize clipboard data: {e}")
+            print(f"[!] Binary deserialization failed: {e}")
             return ClipboardData()
 
     def get_hash(self) -> str:

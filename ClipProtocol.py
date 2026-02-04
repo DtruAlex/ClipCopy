@@ -8,6 +8,10 @@ class PacketType:
     JOIN_ROOM = 0x05         # Join a room
     LEAVE_ROOM = 0x06        # Leave a room
     CLIPBOARD_FORMATS = 0x08 # Rich clipboard (multiple formats)
+    AUTH_CHALLENGE = 0x09    # Hub sends challenge for authentication
+    AUTH_RESPONSE = 0x0A     # Client sends signed response
+    AUTH_SUCCESS = 0x0B      # Hub confirms authentication success
+    AUTH_FAILURE = 0x0C      # Hub rejects authentication
 
 
 class ClipProtocol:

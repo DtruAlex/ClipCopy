@@ -1,6 +1,7 @@
 """
-Multi-room clipboard synchronization agent with rich clipboard support.
+Multi-room clipboard synchronization agent with AES-256-GCM encryption.
 Automatically syncs clipboard changes (Ctrl+C) across all joined rooms.
+Uses pure binary serialization and authenticated encryption.
 """
 import socket
 import threading
@@ -10,7 +11,7 @@ from typing import Dict, Optional, Callable, Set
 
 from ClipProtocol import ClipProtocol, PacketType
 from clipboard_handler import ClipboardHandler, ClipboardData
-from utils import crypt
+from utils import SecurityEngine
 
 
 @dataclass
@@ -91,7 +92,7 @@ class MultiRoomAgent:
             self.on_status_change("disconnected")
 
     def join_room(self, room_name: str, encryption_key: str) -> bool:
-        """Join a new room"""
+        """Join a new room with authentication"""
         with self.lock:
             if room_name in self.rooms:
                 if self.on_error:
@@ -104,19 +105,19 @@ class MultiRoomAgent:
                 return False
 
             try:
-                # Create room context
+                # Store room context with encryption key (auth pending)
                 self.rooms[room_name] = RoomContext(
                     name=room_name,
                     encryption_key=encryption_key,
                     last_activity=time.time()
                 )
 
-                # Send JOIN packet
+                # Send JOIN packet (hub will respond with challenge)
                 packet = ClipProtocol.pack(room_name, b'', PacketType.JOIN_ROOM)
                 self.sock.sendall(packet)
 
-                if self.on_room_change:
-                    self.on_room_change('join', room_name)
+                # Note: Room is not fully joined yet - waiting for auth challenge
+                # The receiver loop will handle the challenge-response
 
                 return True
             except Exception as e:
@@ -206,11 +207,14 @@ class MultiRoomAgent:
                     with self.lock:
                         for room_name, room_ctx in list(self.rooms.items()):
                             try:
-                                # Serialize clipboard data
-                                clipboard_bytes = clipboard_data.to_bytes()
+                                # Serialize clipboard data to pure binary
+                                clipboard_binary = clipboard_data.to_bytes()
 
-                                # Encrypt with room's key
-                                encrypted = crypt(clipboard_bytes, room_ctx.encryption_key)
+                                # Encrypt with AES-256-GCM (includes auth tag)
+                                encrypted = SecurityEngine.encrypt_binary(
+                                    clipboard_binary,
+                                    room_ctx.encryption_key
+                                )
 
                                 # Send packet
                                 packet = ClipProtocol.pack(
@@ -271,7 +275,43 @@ class MultiRoomAgent:
                 if not encrypted_payload:
                     break
 
-                # Process if we're in this room
+                # Handle authentication packets
+                if p_type == PacketType.AUTH_CHALLENGE:
+                    # Hub sent us a challenge - we need to sign it with our room key
+                    with self.lock:
+                        if room_name not in self.rooms:
+                            continue
+
+                        room_ctx = self.rooms[room_name]
+                        challenge = encrypted_payload
+
+                        # Sign challenge with room key: HMAC(key, challenge)
+                        import hmac
+                        import hashlib
+                        key_hash = hashlib.sha256(room_ctx.encryption_key.encode()).digest()
+                        response = hmac.new(key_hash, challenge, hashlib.sha256).digest()
+
+                        # Send response back
+                        response_packet = ClipProtocol.pack(room_name, response, PacketType.AUTH_RESPONSE)
+                        self.sock.sendall(response_packet)
+                        continue
+
+                elif p_type == PacketType.AUTH_SUCCESS:
+                    # Authentication successful - we're now in the room
+                    if self.on_room_change:
+                        self.on_room_change('join', room_name)
+                    continue
+
+                elif p_type == PacketType.AUTH_FAILURE:
+                    # Authentication failed - wrong password
+                    with self.lock:
+                        if room_name in self.rooms:
+                            del self.rooms[room_name]
+                    if self.on_error:
+                        self.on_error(f"Failed to join room '{room_name}': Wrong password")
+                    continue
+
+                # Process clipboard data if we're in this room
                 with self.lock:
                     if room_name not in self.rooms:
                         continue
@@ -279,11 +319,15 @@ class MultiRoomAgent:
                     room_ctx = self.rooms[room_name]
 
                     try:
-                        # Decrypt with room's key
-                        decrypted = crypt(encrypted_payload, room_ctx.encryption_key)
+                        # Decrypt with AES-256-GCM (verifies auth tag)
+                        # Will raise exception if authentication fails
+                        decrypted_binary = SecurityEngine.decrypt_binary(
+                            encrypted_payload,
+                            room_ctx.encryption_key
+                        )
 
-                        # Deserialize clipboard data
-                        clipboard_data = ClipboardData.from_bytes(decrypted)
+                        # Deserialize from pure binary format
+                        clipboard_data = ClipboardData.from_bytes(decrypted_binary)
 
                         if clipboard_data.is_empty():
                             continue
@@ -305,7 +349,8 @@ class MultiRoomAgent:
 
                     except Exception as e:
                         if self.on_error:
-                            self.on_error(f"Process clipboard from {room_name} failed: {e}")
+                            # This could be authentication failure (wrong key/tampered data)
+                            self.on_error(f"Decrypt failed for {room_name}: {e}")
 
             except Exception as e:
                 if self.running and self.on_error:
