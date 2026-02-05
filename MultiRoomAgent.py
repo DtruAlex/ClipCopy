@@ -1,7 +1,17 @@
 """
-Multi-room clipboard synchronization agent with AES-256-GCM encryption.
-Automatically syncs clipboard changes (Ctrl+C) across all joined rooms.
-Uses pure binary serialization and authenticated encryption.
+Multi-room clipboard synchronization client.
+
+This client connects to a ClipHub server and automatically synchronizes
+clipboard changes across multiple rooms. It monitors the local clipboard
+and sends updates to all joined rooms, and receives updates from other
+clients in those rooms.
+
+Key Features:
+- Automatic clipboard monitoring (detects Ctrl+C copy events)
+- Support for multiple simultaneous rooms
+- End-to-end encryption (per-room passwords)
+- Rich clipboard support (text, images, HTML, etc.)
+- Echo prevention (doesn't re-broadcast received content)
 """
 import socket
 import threading
@@ -16,57 +26,99 @@ from utils import SecurityEngine
 
 @dataclass
 class RoomContext:
-    """Context for a single room"""
+    """
+    Information about a joined room.
+
+    Attributes:
+        name: Room name
+        encryption_key: Password for encrypting/decrypting clipboard data
+        last_hash: Hash of last clipboard from this room (prevents echo)
+        sync_count: Number of successful syncs (for statistics)
+        last_activity: Timestamp of last sync activity
+    """
     name: str
     encryption_key: str
-    last_hash: str = ""      # Hash of last clipboard from this room (prevents echo)
-    sync_count: int = 0      # Number of syncs (for stats)
-    last_activity: float = 0.0  # Timestamp of last activity
+    last_hash: str = ""
+    sync_count: int = 0
+    last_activity: float = 0.0
 
 
 class MultiRoomAgent:
     """
-    Clipboard agent that supports multiple rooms with rich clipboard.
+    Clipboard synchronization client.
 
-    Features:
-    - Join/leave multiple rooms dynamically
-    - Automatic clipboard monitoring (polls every 500ms)
-    - Rich clipboard support (text, images, HTML, etc.)
-    - Per-room encryption
-    - Echo prevention (won't re-send received content)
+    Architecture:
+    - Main thread: Creates the agent and handles UI/commands
+    - Monitor thread: Polls clipboard for changes and sends updates
+    - Receiver thread: Receives updates from hub and applies to clipboard
+
+    How it works:
+    1. Connect to hub server
+    2. Join one or more rooms with passwords
+    3. Monitor thread detects local clipboard changes (Ctrl+C)
+    4. Encrypts and sends to all joined rooms
+    5. Receiver thread gets updates from other clients
+    6. Decrypts and applies to local clipboard
+
+    Echo prevention:
+    - Tracks hashes of recently received clipboards
+    - Won't re-send clipboard content that was just received
+    - This prevents infinite loops of clipboard updates
     """
 
     def __init__(self, hub_host: str = '127.0.0.1', hub_port: int = 9999,
                  poll_interval: float = 0.1):
+        """
+        Initialize the clipboard agent.
+
+        Args:
+            hub_host: IP address or hostname of the hub server
+            hub_port: Port number the hub is listening on
+            poll_interval: How often to check clipboard (seconds, default 0.1 = 100ms)
+        """
         self.hub_host = hub_host
         self.hub_port = hub_port
         self.poll_interval = poll_interval
 
+        # Network connection
         self.sock: Optional[socket.socket] = None
+
+        # Room management: maps room name to room info
         self.rooms: Dict[str, RoomContext] = {}
+
+        # Clipboard handler
         self.clipboard_handler = ClipboardHandler()
+
+        # Control flags
         self.running = False
         self.connected = False
+
+        # Thread safety
         self.lock = threading.RLock()
 
-        # Set of hashes we recently received (to prevent echo)
+        # Echo prevention: Track recently received clipboard hashes
         self.received_hashes: Set[str] = set()
         self.max_received_hashes = 100  # Limit memory usage
 
-        # Callbacks for TUI integration
+        # Callbacks for UI integration (optional)
         self.on_clipboard_send: Optional[Callable[[str, ClipboardData], None]] = None
         self.on_clipboard_receive: Optional[Callable[[str, ClipboardData], None]] = None
-        self.on_room_change: Optional[Callable[[str, str], None]] = None  # (action, room_name)
+        self.on_room_change: Optional[Callable[[str, str], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
-        self.on_status_change: Optional[Callable[[str], None]] = None  # (status)
+        self.on_status_change: Optional[Callable[[str], None]] = None
 
     def connect(self) -> bool:
-        """Connect to the hub server"""
+        """
+        Establish connection to the hub server.
+
+        Returns:
+            True if connection successful, False otherwise
+        """
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(10.0)  # Connection timeout
+            self.sock.settimeout(10.0)  # 10 second connection timeout
             self.sock.connect((self.hub_host, self.hub_port))
-            self.sock.settimeout(None)  # Disable timeout for normal ops
+            self.sock.settimeout(None)  # Disable timeout for normal operations
             self.connected = True
 
             if self.on_status_change:
@@ -79,7 +131,7 @@ class MultiRoomAgent:
             return False
 
     def disconnect(self):
-        """Disconnect from the hub"""
+        """Close connection to the hub server."""
         self.connected = False
         if self.sock:
             try:
@@ -92,7 +144,23 @@ class MultiRoomAgent:
             self.on_status_change("disconnected")
 
     def join_room(self, room_name: str, encryption_key: str) -> bool:
-        """Join a new room with authentication"""
+        """
+        Join a room with password-based authentication.
+
+        Authentication flow:
+        1. Send JOIN_ROOM request
+        2. Hub responds with AUTH_CHALLENGE
+        3. Client signs challenge with password-derived key
+        4. Send AUTH_RESPONSE
+        5. Hub verifies and sends AUTH_SUCCESS or AUTH_FAILURE
+
+        Args:
+            room_name: Name of the room to join
+            encryption_key: Password for this room
+
+        Returns:
+            True if join request sent successfully (auth happens asynchronously)
+        """
         with self.lock:
             if room_name in self.rooms:
                 if self.on_error:
@@ -105,20 +173,19 @@ class MultiRoomAgent:
                 return False
 
             try:
-                # Store room context with encryption key (auth pending)
+                # Create room context (stores password for authentication and encryption)
                 self.rooms[room_name] = RoomContext(
                     name=room_name,
                     encryption_key=encryption_key,
                     last_activity=time.time()
                 )
 
-                # Send JOIN packet (hub will respond with challenge)
+                # Send join request (hub will respond with challenge)
                 packet = ClipProtocol.pack(room_name, b'', PacketType.JOIN_ROOM)
                 self.sock.sendall(packet)
 
-                # Note: Room is not fully joined yet - waiting for auth challenge
-                # The receiver loop will handle the challenge-response
-
+                # Note: Room isn't fully joined yet - waiting for auth
+                # The receiver thread will handle the challenge-response
                 return True
             except Exception as e:
                 # Remove room on failure
@@ -129,7 +196,15 @@ class MultiRoomAgent:
                 return False
 
     def leave_room(self, room_name: str) -> bool:
-        """Leave a room"""
+        """
+        Leave a room.
+
+        Args:
+            room_name: Name of the room to leave
+
+        Returns:
+            True if successfully left
+        """
         with self.lock:
             if room_name not in self.rooms:
                 if self.on_error:
@@ -142,11 +217,11 @@ class MultiRoomAgent:
                 return True
 
             try:
-                # Send LEAVE packet
+                # Send LEAVE packet to hub
                 packet = ClipProtocol.pack(room_name, b'', PacketType.LEAVE_ROOM)
                 self.sock.sendall(packet)
 
-                # Remove from local registry
+                # Remove from local list
                 del self.rooms[room_name]
 
                 if self.on_room_change:
@@ -159,7 +234,18 @@ class MultiRoomAgent:
                 return False
 
     def recv_all(self, n: int) -> Optional[bytes]:
-        """Receive exactly n bytes from socket"""
+        """
+        Receive exactly n bytes from the socket.
+
+        TCP is a stream protocol - data might arrive in multiple chunks.
+        This method ensures we get all the bytes we're expecting.
+
+        Args:
+            n: Number of bytes to receive
+
+        Returns:
+            Bytes received, or None if connection closed
+        """
         if not self.sock:
             return None
 
@@ -168,7 +254,7 @@ class MultiRoomAgent:
             try:
                 packet = self.sock.recv(n - len(data))
                 if not packet:
-                    return None
+                    return None  # Connection closed
                 data += packet
             except socket.timeout:
                 continue
@@ -177,22 +263,41 @@ class MultiRoomAgent:
         return data
 
     def _add_received_hash(self, hash_val: str):
-        """Track received clipboard hashes to prevent echo"""
+        """
+        Track a received clipboard hash to prevent echo.
+
+        When we receive clipboard data from a room, we track its hash.
+        If we detect the same content in our local clipboard, we won't
+        send it back to avoid an infinite loop.
+
+        Args:
+            hash_val: Hash of received clipboard content
+        """
         self.received_hashes.add(hash_val)
-        # Limit memory usage
+        # Limit memory usage by removing old hashes
         if len(self.received_hashes) > self.max_received_hashes:
-            # Remove oldest (arbitrary since it's a set)
+            # Remove one hash (arbitrary since it's a set)
             self.received_hashes.pop()
 
     def _monitor_loop(self):
-        """Background thread: Monitor clipboard and sync to all rooms"""
+        """
+        Background thread: Monitor local clipboard and send changes to all rooms.
+
+        This thread runs continuously while the agent is active.
+        It checks the clipboard every poll_interval seconds for changes.
+        When it detects a change (e.g., user pressed Ctrl+C), it:
+        1. Encrypts the clipboard data with each room's password
+        2. Sends to all joined rooms
+        3. Updates room statistics
+        """
         while self.running:
             try:
+                # Skip if not connected or no rooms
                 if not self.connected or not self.rooms:
                     time.sleep(self.poll_interval)
                     continue
 
-                # Check if clipboard changed
+                # Check if clipboard changed since last check
                 clipboard_data = self.clipboard_handler.get_if_changed()
 
                 if clipboard_data and not clipboard_data.is_empty():
@@ -207,27 +312,30 @@ class MultiRoomAgent:
                     with self.lock:
                         for room_name, room_ctx in list(self.rooms.items()):
                             try:
-                                # Serialize clipboard data to pure binary
+                                # Step 1: Serialize clipboard to binary
                                 clipboard_binary = clipboard_data.to_bytes()
 
-                                # Encrypt with AES-256-GCM (includes auth tag)
+                                # Step 2: Encrypt with room's password
                                 encrypted = SecurityEngine.encrypt_binary(
                                     clipboard_binary,
                                     room_ctx.encryption_key
                                 )
 
-                                # Send packet
+                                # Step 3: Pack into protocol message
                                 packet = ClipProtocol.pack(
                                     room_name,
                                     encrypted,
                                     PacketType.CLIPBOARD_FORMATS
                                 )
+
+                                # Step 4: Send to hub
                                 self.sock.sendall(packet)
 
-                                # Update room stats
+                                # Update statistics
                                 room_ctx.sync_count += 1
                                 room_ctx.last_activity = time.time()
 
+                                # Notify UI (if callback set)
                                 if self.on_clipboard_send:
                                     self.on_clipboard_send(room_name, clipboard_data)
 
@@ -243,14 +351,22 @@ class MultiRoomAgent:
                 time.sleep(self.poll_interval)
 
     def _receiver_loop(self):
-        """Background thread: Receive clipboard updates from hub"""
+        """
+        Background thread: Receive clipboard updates from hub.
+
+        This thread runs continuously while the agent is active.
+        It receives messages from the hub and processes them:
+        - AUTH_CHALLENGE: Sign with password and respond
+        - AUTH_SUCCESS/FAILURE: Handle authentication result
+        - CLIPBOARD_FORMATS: Decrypt and apply to local clipboard
+        """
         while self.running:
             try:
                 if not self.connected:
                     time.sleep(0.1)
                     continue
 
-                # Read header
+                # Step 1: Read message header
                 header_data = self.recv_all(ClipProtocol.HEADER_SIZE)
                 if not header_data:
                     # Connection closed
@@ -262,22 +378,23 @@ class MultiRoomAgent:
                             self.on_error("Connection lost")
                     break
 
-                magic, ver, p_type, r_len, d_len = ClipProtocol.unpack_header(header_data)
+                # Step 2: Parse header
+                magic, ver, packet_type, room_len, data_len = ClipProtocol.unpack_header(header_data)
 
-                # Read room name
-                room_bytes = self.recv_all(r_len)
+                # Step 3: Read room name
+                room_bytes = self.recv_all(room_len)
                 if not room_bytes:
                     break
                 room_name = room_bytes.decode('utf-8')
 
-                # Read payload
-                encrypted_payload = self.recv_all(d_len)
+                # Step 4: Read payload
+                encrypted_payload = self.recv_all(data_len)
                 if not encrypted_payload:
                     break
 
-                # Handle authentication packets
-                if p_type == PacketType.AUTH_CHALLENGE:
-                    # Hub sent us a challenge - we need to sign it with our room key
+                # Step 5: Handle message based on type
+                if packet_type == PacketType.AUTH_CHALLENGE:
+                    # Hub sent authentication challenge
                     with self.lock:
                         if room_name not in self.rooms:
                             continue
@@ -285,24 +402,24 @@ class MultiRoomAgent:
                         room_ctx = self.rooms[room_name]
                         challenge = encrypted_payload
 
-                        # Sign challenge with room key: HMAC(key, challenge)
+                        # Sign challenge with password: HMAC(password_hash, challenge)
                         import hmac
                         import hashlib
                         key_hash = hashlib.sha256(room_ctx.encryption_key.encode()).digest()
                         response = hmac.new(key_hash, challenge, hashlib.sha256).digest()
 
-                        # Send response back
+                        # Send signed response back to hub
                         response_packet = ClipProtocol.pack(room_name, response, PacketType.AUTH_RESPONSE)
                         self.sock.sendall(response_packet)
                         continue
 
-                elif p_type == PacketType.AUTH_SUCCESS:
+                elif packet_type == PacketType.AUTH_SUCCESS:
                     # Authentication successful - we're now in the room
                     if self.on_room_change:
                         self.on_room_change('join', room_name)
                     continue
 
-                elif p_type == PacketType.AUTH_FAILURE:
+                elif packet_type == PacketType.AUTH_FAILURE:
                     # Authentication failed - wrong password
                     with self.lock:
                         if room_name in self.rooms:
@@ -319,37 +436,37 @@ class MultiRoomAgent:
                     room_ctx = self.rooms[room_name]
 
                     try:
-                        # Decrypt with AES-256-GCM (verifies auth tag)
-                        # Will raise exception if authentication fails
+                        # Step 1: Decrypt with room password (verifies auth tag)
                         decrypted_binary = SecurityEngine.decrypt_binary(
                             encrypted_payload,
                             room_ctx.encryption_key
                         )
 
-                        # Deserialize from pure binary format
+                        # Step 2: Deserialize from binary format
                         clipboard_data = ClipboardData.from_bytes(decrypted_binary)
 
                         if clipboard_data.is_empty():
                             continue
 
-                        # Track hash to prevent echo
+                        # Step 3: Track hash to prevent echo
                         current_hash = clipboard_data.get_hash()
                         self._add_received_hash(current_hash)
 
-                        # Update local clipboard
+                        # Step 4: Update local clipboard
                         self.clipboard_handler.set_clipboard(clipboard_data)
 
-                        # Update room stats
+                        # Update statistics
                         room_ctx.sync_count += 1
                         room_ctx.last_activity = time.time()
                         room_ctx.last_hash = current_hash
 
+                        # Notify UI (if callback set)
                         if self.on_clipboard_receive:
                             self.on_clipboard_receive(room_name, clipboard_data)
 
                     except Exception as e:
                         if self.on_error:
-                            # This could be authentication failure (wrong key/tampered data)
+                            # Could be wrong password or tampered data
                             self.on_error(f"Decrypt failed for {room_name}: {e}")
 
             except Exception as e:
@@ -358,7 +475,17 @@ class MultiRoomAgent:
                 time.sleep(0.1)
 
     def start(self) -> bool:
-        """Start the agent (connect and start background threads)"""
+        """
+        Start the clipboard agent.
+
+        This will:
+        1. Connect to the hub server
+        2. Start the monitor thread (watches clipboard for changes)
+        3. Start the receiver thread (receives updates from hub)
+
+        Returns:
+            True if started successfully, False if connection failed
+        """
         if self.running:
             return True
 
@@ -367,14 +494,14 @@ class MultiRoomAgent:
 
         self.running = True
 
-        # Start monitor thread (watches clipboard, sends changes)
+        # Start clipboard monitor thread
         self._monitor_thread = threading.Thread(
             target=self._monitor_loop,
             name="ClipboardMonitor",
-            daemon=True
+            daemon=True  # Thread will exit when main program exits
         )
 
-        # Start receiver thread (receives changes from others)
+        # Start message receiver thread
         self._receiver_thread = threading.Thread(
             target=self._receiver_loop,
             name="ClipboardReceiver",
@@ -387,16 +514,26 @@ class MultiRoomAgent:
         return True
 
     def stop(self):
-        """Stop the agent"""
+        """
+        Stop the clipboard agent.
+
+        Disconnects from hub and clears all rooms.
+        The background threads will exit automatically.
+        """
         self.running = False
         self.disconnect()
 
-        # Clear rooms
+        # Clear all rooms
         with self.lock:
             self.rooms.clear()
 
     def get_rooms_info(self) -> Dict[str, dict]:
-        """Get info about all rooms (for TUI display)"""
+        """
+        Get information about all joined rooms (for UI display).
+
+        Returns:
+            Dictionary mapping room names to their stats
+        """
         with self.lock:
             return {
                 name: {
@@ -407,11 +544,19 @@ class MultiRoomAgent:
             }
 
     def get_room_count(self) -> int:
-        """Get number of joined rooms"""
+        """Get the number of rooms currently joined."""
         with self.lock:
             return len(self.rooms)
 
     def is_in_room(self, room_name: str) -> bool:
-        """Check if agent is in a specific room"""
+        """
+        Check if agent is in a specific room.
+
+        Args:
+            room_name: Name of the room to check
+
+        Returns:
+            True if currently in this room
+        """
         with self.lock:
             return room_name in self.rooms

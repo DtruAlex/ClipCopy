@@ -1,46 +1,59 @@
 """
-Multi-room clipboard synchronization hub with AES-256-GCM support.
-This is the server/relay that routes encrypted clipboard data between clients.
-Implements challenge-response authentication to prevent unauthorized room access.
+Multi-room clipboard synchronization server.
+
+This is the central hub that routes encrypted clipboard data between clients.
+The hub never decrypts data - it only verifies that clients know the room password
+and then relays encrypted messages between clients in the same room.
+
+Key Features:
+- Multiple isolated rooms (like chat rooms)
+- Password authentication using challenge-response
+- End-to-end encryption (hub never sees plaintext)
+- Binary protocol for efficiency
 """
 import socket
 import threading
 import os
-import hashlib
-import hmac
 from ClipProtocol import ClipProtocol, PacketType
 
 
 class ClipHub:
     """
-    Multi-room clipboard synchronization hub with authentication.
+    Central server for clipboard synchronization.
 
-    Acts as a relay server that routes encrypted clipboard data
-    between clients in the same room. The hub never decrypts data.
+    Acts as a relay that routes encrypted clipboard data between clients
+    in the same room. The hub never decrypts clipboard data.
 
-    Security: Uses challenge-response authentication to verify clients
-    know the room password before allowing them to join.
+    Authentication:
+    - First client to join a room sets the password
+    - Subsequent clients must prove they know the same password
+    - Uses challenge-response to verify without transmitting password
     """
 
     def __init__(self, host='0.0.0.0', port=9999):
+        # Setup network socket
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((host, port))
         self.server_socket.listen(5)
 
-        # Room Registry: { "room_name": [socket1, socket2, ...] }
+        # Room management
+        # Maps room name to list of connected client sockets
         self.rooms = {}
 
-        # Client to Rooms mapping: { socket: set("room1", "room2", ...) }
+        # Maps client socket to set of room names they've joined
         self.client_rooms = {}
 
-        # Room Password Hashes: { "room_name": sha256_hash }
-        # First client to join sets the password hash
+        # Password verification data for each room
+        # Maps room name to {'challenge': bytes, 'response': bytes}
+        # This stores the challenge and expected response for authentication
         self.room_password_hashes = {}
 
-        # Pending auth challenges: { socket: {"room": str, "challenge": bytes} }
+        # Temporary storage for ongoing authentication attempts
+        # Maps client socket to {'room': str, 'challenge': bytes}
         self.pending_challenges = {}
 
+        # Thread safety lock
         self.lock = threading.Lock()
 
         print(f"[*] Multi-Room Clipboard Hub initialized on {host}:{port}")
@@ -49,39 +62,63 @@ class ClipHub:
         print(f"[*] Binary protocol (no JSON overhead)")
 
     def send_auth_challenge(self, client_socket, room_name):
-        """Send authentication challenge to client"""
+        """
+        Send authentication challenge to client.
+
+        For new rooms: Generate a random challenge
+        For existing rooms: Reuse the stored challenge (so we can verify responses match)
+        """
         with self.lock:
-            # For existing rooms, reuse the stored challenge
-            # This allows us to verify if clients produce the same HMAC signature
             if room_name in self.room_password_hashes:
+                # Room exists - reuse the challenge so we can verify password match
                 challenge = self.room_password_hashes[room_name]['challenge']
                 print(f"[🔐] Sending stored challenge for room '{room_name}' (verification)")
             else:
-                # For new rooms, generate random challenge
+                # New room - generate random challenge
                 challenge = os.urandom(32)
                 print(f"[🔐] Sending new challenge for room '{room_name}' (first client)")
 
-            # Store pending challenge
+            # Store pending challenge for this client
             self.pending_challenges[client_socket] = {
                 "room": room_name,
                 "challenge": challenge
             }
 
-        # Send challenge packet
+        # Send challenge packet to client
         packet = ClipProtocol.pack(room_name, challenge, PacketType.AUTH_CHALLENGE)
         client_socket.sendall(packet)
 
     def verify_auth_response(self, client_socket, room_name, response):
-        """Verify client's authentication response using HMAC"""
+        """
+        Verify client's authentication response using HMAC.
+
+        How it works:
+        1. Hub sends challenge (random bytes)
+        2. Client computes: HMAC(password_hash, challenge)
+        3. Hub checks if response matches expected value
+
+        For first client: Store their response as the "correct" answer
+        For later clients: Verify their response matches the first client's
+
+        This proves all clients know the same password without transmitting it!
+
+        Args:
+            client_socket: The client attempting to join
+            room_name: Name of the room they're joining
+            response: The HMAC response from the client
+
+        Returns:
+            True if authentication succeeds, False otherwise
+        """
         with self.lock:
-            # Check if we have a pending challenge for this socket
+            # Verify we have a pending challenge for this client
             if client_socket not in self.pending_challenges:
                 print(f"[!] No pending challenge for client")
                 return False
 
             challenge_data = self.pending_challenges[client_socket]
 
-            # Verify room matches
+            # Verify the room name matches
             if challenge_data["room"] != room_name:
                 print(f"[!] Room mismatch in auth response")
                 del self.pending_challenges[client_socket]
@@ -89,28 +126,10 @@ class ClipHub:
 
             challenge = challenge_data["challenge"]
 
-            # For first client joining room, store their password-derived key hash
-            # by extracting it from their HMAC response
+            # First client joining this room - establish the password
             if room_name not in self.room_password_hashes:
-                # First client sets the password
-                # We store the hash of their derived key (which was used in HMAC)
-                # Since we have: response = HMAC(key_hash, challenge)
-                # We can't reverse HMAC, but we can store response and verify
-                # future clients produce same response to same challenge
-
-                # Better approach: Store the password hash from the response
-                # by storing the response itself and re-using same challenge for verification
-
-                # Actually, we need to store the PASSWORD HASH, not the response
-                # The response is HMAC(password_hash, challenge)
-                # We can verify by checking if new clients produce matching HMAC
-
-                # Store the password hash by having client send it directly in first join
-                # For now, let's use a simpler approach: trust first client and verify
-                # subsequent clients by having them prove they know the same password
-
-                # Solution: Store the response, and for subsequent clients,
-                # send the SAME challenge and verify they produce SAME response
+                # Store the challenge and response
+                # Future clients must provide the same response to the same challenge
                 self.room_password_hashes[room_name] = {
                     'challenge': challenge,
                     'response': response
@@ -119,50 +138,29 @@ class ClipHub:
                 print(f"[🔑] Room '{room_name}' password established (first client)")
                 return True
 
-            # For subsequent clients, verify they produce the same response
-            # to the same challenge that the first client received
+            # Verify subsequent clients
             stored_data = self.room_password_hashes[room_name]
-            stored_challenge = stored_data['challenge']
             stored_response = stored_data['response']
 
-            # We need to re-send the STORED challenge to verify
-            # But we already sent a random challenge! This won't work.
+            # Clean up pending challenge
+            del self.pending_challenges[client_socket]
 
-            # Better approach: Use the SAME challenge for all verifications
-            # Or: Compare if response was created with same key
-
-            # Since challenge was already sent (random), we need different approach:
-            # Send the STORED challenge to new clients instead of random one!
-            # Let's fix send_auth_challenge to use stored challenge if room exists
-
-            # For now, let's use a workaround: verify HMAC structure
-            # We know: response = HMAC(password_hash, challenge)
-            # We can't verify without knowing password_hash
-
-            # Simplest fix: Make the challenge deterministic for a room
-            # Or: Send same challenge that was sent to first client
-
-            # Let's compare if challenge was the stored one
-            if challenge != stored_challenge:
-                # New challenge was sent, need to verify differently
-                # This means we need to fix send_auth_challenge to reuse
-                # stored challenge for existing rooms
-                print(f"[!] Different challenge used - verification not possible")
-                del self.pending_challenges[client_socket]
-                return False
-
-            # Same challenge - verify response matches
+            # Compare the responses - they should match if same password
             if response == stored_response:
-                del self.pending_challenges[client_socket]
                 print(f"[✅] Auth successful for room '{room_name}'")
                 return True
             else:
-                del self.pending_challenges[client_socket]
                 print(f"[❌] Auth failed for room '{room_name}' (wrong password)")
                 return False
 
     def join_room(self, client_socket, room_name):
-        """Add client to a room"""
+        """
+        Add a client to a room (after successful authentication).
+
+        Args:
+            client_socket: The authenticated client's socket
+            room_name: Name of the room to join
+        """
         with self.lock:
             # Add to room registry
             if room_name not in self.rooms:
@@ -170,7 +168,7 @@ class ClipHub:
             if client_socket not in self.rooms[room_name]:
                 self.rooms[room_name].append(client_socket)
 
-            # Track client's rooms
+            # Track which rooms this client is in
             if client_socket not in self.client_rooms:
                 self.client_rooms[client_socket] = set()
             self.client_rooms[client_socket].add(room_name)
@@ -180,30 +178,46 @@ class ClipHub:
             print(f"[+] Client joined room '{room_name}' (now in {room_count} room(s), {clients_in_room} clients in room)")
 
     def leave_room(self, client_socket, room_name):
-        """Remove client from a room"""
+        """
+        Remove a client from a room.
+
+        Args:
+            client_socket: The client's socket
+            room_name: Name of the room to leave
+        """
         with self.lock:
+            # Remove from room
             if room_name in self.rooms and client_socket in self.rooms[room_name]:
                 self.rooms[room_name].remove(client_socket)
                 print(f"[-] Client left room '{room_name}'")
 
-                # Clean up empty rooms
+                # Clean up empty rooms to save memory
                 if not self.rooms[room_name]:
                     del self.rooms[room_name]
                     print(f"[*] Room '{room_name}' is now empty (removed)")
 
+            # Update client's room list
             if client_socket in self.client_rooms:
                 self.client_rooms[client_socket].discard(room_name)
 
     def broadcast(self, room_name, packet, sender_socket):
         """
-        Relay encrypted clipboard data to all clients in the room except sender.
-        Hub never decrypts - just relays the encrypted binary data.
+        Send encrypted clipboard data to all clients in a room (except the sender).
+
+        The hub never decrypts the data - it just relays the encrypted packet
+        to all other clients in the same room.
+
+        Args:
+            room_name: Name of the room to broadcast to
+            packet: Complete encrypted packet to send
+            sender_socket: The client who sent this data (won't receive it back)
         """
         with self.lock:
             if room_name in self.rooms:
                 sent_count = 0
                 stale_sockets = []
 
+                # Send to each client in the room (except sender)
                 for client in self.rooms[room_name]:
                     if client is not sender_socket:
                         try:
@@ -213,7 +227,7 @@ class ClipHub:
                             print(f"[!] Failed to send to client: {e}")
                             stale_sockets.append(client)
 
-                # Cleanup disconnected clients
+                # Remove disconnected clients
                 for stale in stale_sockets:
                     self.rooms[room_name].remove(stale)
                     if stale in self.client_rooms:
@@ -223,55 +237,73 @@ class ClipHub:
                     print(f"[📤] Broadcasted to {sent_count} client(s) in '{room_name}'")
 
     def handle_client(self, client_socket, addr):
-        """Handle multi-room client connection"""
+        """
+        Handle all communication with a connected client.
+
+        This method runs in a separate thread for each client.
+        It receives messages, processes them based on type, and handles cleanup.
+
+        Message handling flow:
+        1. Client sends JOIN_ROOM request
+        2. Hub sends AUTH_CHALLENGE
+        3. Client sends AUTH_RESPONSE
+        4. Hub verifies and sends AUTH_SUCCESS or AUTH_FAILURE
+        5. If successful, client can send/receive clipboard data
+
+        Args:
+            client_socket: The client's network socket
+            addr: Client's address (for logging)
+        """
         print(f"[*] Client {addr} connected")
 
         try:
             while True:
-                # Read header (11 bytes)
+                # Step 1: Read the message header (11 bytes)
                 header_data = self.recv_all(client_socket, ClipProtocol.HEADER_SIZE)
                 if not header_data:
-                    break
+                    break  # Connection closed
 
-                magic, ver, p_type, r_len, d_len = ClipProtocol.unpack_header(header_data)
+                # Step 2: Parse the header
+                magic, ver, packet_type, room_len, data_len = ClipProtocol.unpack_header(header_data)
 
-                # Validate magic bytes
+                # Step 3: Validate magic bytes (protocol verification)
                 if magic != ClipProtocol.MAGIC:
                     print(f"[!] Invalid magic bytes from {addr}")
                     break
 
-                # Extract room name
-                room_name = self.recv_all(client_socket, r_len).decode('utf-8')
+                # Step 4: Read room name
+                room_name = self.recv_all(client_socket, room_len).decode('utf-8')
 
-                # Extract payload (encrypted data)
-                payload = self.recv_all(client_socket, d_len)
+                # Step 5: Read data payload
+                payload = self.recv_all(client_socket, data_len)
 
-                # Handle different packet types
-                if p_type == PacketType.JOIN_ROOM:
-                    # Send authentication challenge instead of immediately joining
+                # Step 6: Handle message based on type
+                if packet_type == PacketType.JOIN_ROOM:
+                    # Client wants to join - send authentication challenge
                     self.send_auth_challenge(client_socket, room_name)
 
-                elif p_type == PacketType.AUTH_RESPONSE:
-                    # Verify authentication response
+                elif packet_type == PacketType.AUTH_RESPONSE:
+                    # Client responded to challenge - verify password
                     if self.verify_auth_response(client_socket, room_name, payload):
-                        # Auth successful - join the room
+                        # Authentication successful
                         self.join_room(client_socket, room_name)
-                        # Send success confirmation
                         success_packet = ClipProtocol.pack(room_name, b'OK', PacketType.AUTH_SUCCESS)
                         client_socket.sendall(success_packet)
                     else:
-                        # Auth failed - send failure
+                        # Authentication failed
                         failure_packet = ClipProtocol.pack(room_name, b'FAIL', PacketType.AUTH_FAILURE)
                         client_socket.sendall(failure_packet)
 
-                elif p_type == PacketType.LEAVE_ROOM:
+                elif packet_type == PacketType.LEAVE_ROOM:
+                    # Client wants to leave a room
                     self.leave_room(client_socket, room_name)
 
-                elif p_type in (PacketType.DATA, PacketType.CLIPBOARD_FORMATS):
-                    # Only allow data if client is in the room
+                elif packet_type in (PacketType.DATA, PacketType.CLIPBOARD_FORMATS):
+                    # Client is sending clipboard data
+                    # Verify they're actually in this room before relaying
                     if client_socket in self.client_rooms and \
                        room_name in self.client_rooms.get(client_socket, set()):
-                        # Broadcast encrypted data to room (hub never decrypts)
+                        # Broadcast encrypted data to other clients in room
                         full_packet = header_data + room_name.encode('utf-8') + payload
                         self.broadcast(room_name, full_packet, client_socket)
                     else:
@@ -280,7 +312,7 @@ class ClipHub:
         except Exception as e:
             print(f"[!] Client {addr} error: {e}")
         finally:
-            # Cleanup: remove client from all rooms
+            # Cleanup: Remove client from all rooms when they disconnect
             print(f"[*] Client {addr} disconnected")
             with self.lock:
                 if client_socket in self.client_rooms:
@@ -292,26 +324,46 @@ class ClipHub:
             client_socket.close()
 
     def recv_all(self, sock, n):
-        """Receive exactly n bytes from socket"""
+        """
+        Receive exactly n bytes from a socket.
+
+        TCP doesn't guarantee all data arrives in one packet, so we need
+        to keep reading until we have all the bytes we expect.
+
+        Args:
+            sock: Socket to read from
+            n: Number of bytes to receive
+
+        Returns:
+            Bytes received, or None if connection closed
+        """
         data = b''
         while len(data) < n:
             packet = sock.recv(n - len(data))
             if not packet:
-                return None
+                return None  # Connection closed
             data += packet
         return data
 
     def run(self):
-        """Main server loop"""
+        """
+        Main server loop - accepts incoming connections.
+
+        Runs forever until interrupted with Ctrl+C.
+        Each client connection is handled in a separate thread.
+        """
         print("[*] Waiting for clients...")
         print("[*] Press Ctrl+C to stop")
         try:
             while True:
+                # Accept new client connection
                 client_sock, addr = self.server_socket.accept()
+
+                # Create a new thread to handle this client
                 thread = threading.Thread(
                     target=self.handle_client,
                     args=(client_sock, addr),
-                    daemon=True
+                    daemon=True  # Thread dies when main program exits
                 )
                 thread.start()
         except KeyboardInterrupt:

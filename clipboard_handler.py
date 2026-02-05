@@ -1,7 +1,14 @@
 """
-Cross-platform rich clipboard handler.
-Supports text, images, HTML, and detects clipboard changes.
-Uses PURE BINARY serialization (no JSON).
+Cross-platform clipboard handler for rich content.
+
+Supports multiple clipboard formats:
+- Text: Plain text
+- Images: PNG format
+- HTML: Formatted text from browsers/word processors
+- RTF: Rich Text Format
+- Files: File paths (for drag-and-drop)
+
+Uses pure binary serialization (more efficient than JSON for binary data).
 """
 import hashlib
 import io
@@ -10,10 +17,10 @@ import platform
 from typing import Dict, Optional, List
 from dataclasses import dataclass
 
-# Platform detection
+# Detect operating system
 SYSTEM = platform.system()
 
-# Try importing optional dependencies
+# Try importing optional libraries (they might not be installed)
 try:
     import pyperclip
     HAS_PYPERCLIP = True
@@ -28,7 +35,7 @@ except ImportError:
     HAS_PIL = False
     print("[!] Pillow not installed - image clipboard disabled")
 
-# Windows-specific
+# Windows-specific clipboard API
 HAS_WIN32 = False
 if SYSTEM == "Windows":
     try:
@@ -41,7 +48,22 @@ if SYSTEM == "Windows":
 
 @dataclass
 class ClipboardData:
-    """Container for clipboard data in multiple formats"""
+    """
+    Container for clipboard data in multiple formats.
+
+    A clipboard can contain multiple formats simultaneously. For example,
+    when you copy formatted text from a browser, it might include:
+    - Plain text version
+    - HTML version with formatting
+    - RTF version for word processors
+
+    Attributes:
+        text: Plain text content
+        html: HTML formatted content
+        image: Image data as PNG bytes
+        rtf: Rich Text Format content
+        files: List of file paths (for copy/paste files)
+    """
     text: Optional[str] = None
     html: Optional[str] = None
     image: Optional[bytes] = None  # PNG bytes
@@ -50,19 +72,26 @@ class ClipboardData:
 
     def to_bytes(self) -> bytes:
         """
-        Serialize clipboard data to PURE BINARY format (no JSON).
+        Convert clipboard data to binary format for network transmission.
 
-        Binary Format:
-        [1 byte flags][conditional segments with length prefixes]
+        Binary Format Structure:
+        ┌─────────┬──────────────────────────────────────────┐
+        │ Flags   │ Data Segments (only if flag bit is set) │
+        │ (1 byte)│ [length][data] [length][data] ...       │
+        └─────────┴──────────────────────────────────────────┘
 
-        Flags (8 bits):
-        - bit 0: has_text
-        - bit 1: has_html
-        - bit 2: has_image
-        - bit 3: has_rtf
-        - bit 4: has_files
+        Flags Byte (8 bits indicate which formats are present):
+        - Bit 0 (0x01): has text
+        - Bit 1 (0x02): has HTML
+        - Bit 2 (0x04): has image
+        - Bit 3 (0x08): has RTF
+        - Bit 4 (0x10): has files
+
+        Each segment has format: [4-byte length][UTF-8 or binary data]
+
+        This binary format is much more efficient than JSON for images.
         """
-        # Calculate presence flags
+        # Step 1: Calculate which formats are present
         flags = 0
         if self.text:  flags |= 0x01
         if self.html:  flags |= 0x02
@@ -70,13 +99,14 @@ class ClipboardData:
         if self.rtf:   flags |= 0x08
         if self.files: flags |= 0x10
 
-        # Build binary payload
+        # Step 2: Build binary payload
         segments = [struct.pack('B', flags)]
 
+        # Step 3: Add each format if present
         # Text segment: [4 bytes length][UTF-8 bytes]
         if self.text:
             text_bytes = self.text.encode('utf-8')
-            segments.append(struct.pack('!I', len(text_bytes)))
+            segments.append(struct.pack('!I', len(text_bytes)))  # !I = big-endian unsigned int
             segments.append(text_bytes)
 
         # HTML segment: [4 bytes length][UTF-8 bytes]
@@ -104,25 +134,39 @@ class ClipboardData:
                 # Truncate path if > 65535 bytes
                 if len(file_bytes) > 65535:
                     file_bytes = file_bytes[:65535]
-                segments.append(struct.pack('!H', len(file_bytes)))
+                segments.append(struct.pack('!H', len(file_bytes)))  # !H = big-endian unsigned short
                 segments.append(file_bytes)
 
+        # Step 4: Combine all segments
         return b''.join(segments)
 
     @staticmethod
     def from_bytes(data: bytes) -> 'ClipboardData':
-        """Deserialize clipboard data from PURE BINARY format"""
+        """
+        Convert binary format back to ClipboardData object.
+
+        This is the reverse of to_bytes(). It reads the flags byte,
+        then reads each segment that was present.
+
+        Args:
+            data: Binary clipboard data
+
+        Returns:
+            ClipboardData object with all formats that were present
+        """
         try:
+            # Validate minimum data
             if not data or len(data) < 1:
                 return ClipboardData()
 
+            # Step 1: Read flags byte
             pos = 0
             flags = data[pos]
             pos += 1
 
             result = ClipboardData()
 
-            # Parse text (bit 0)
+            # Step 2: Read text if present (bit 0)
             if flags & 0x01:
                 if pos + 4 > len(data):
                     return result
@@ -133,7 +177,7 @@ class ClipboardData:
                 result.text = data[pos:pos+length].decode('utf-8', errors='replace')
                 pos += length
 
-            # Parse HTML (bit 1)
+            # Step 3: Read HTML if present (bit 1)
             if flags & 0x02:
                 if pos + 4 > len(data):
                     return result
@@ -144,7 +188,7 @@ class ClipboardData:
                 result.html = data[pos:pos+length].decode('utf-8', errors='replace')
                 pos += length
 
-            # Parse image (bit 2)
+            # Step 4: Read image if present (bit 2)
             if flags & 0x04:
                 if pos + 4 > len(data):
                     return result
@@ -155,7 +199,7 @@ class ClipboardData:
                 result.image = data[pos:pos+length]
                 pos += length
 
-            # Parse RTF (bit 3)
+            # Step 5: Read RTF if present (bit 3)
             if flags & 0x08:
                 if pos + 4 > len(data):
                     return result
@@ -166,7 +210,7 @@ class ClipboardData:
                 result.rtf = data[pos:pos+length].decode('utf-8', errors='replace')
                 pos += length
 
-            # Parse files (bit 4)
+            # Step 6: Read files if present (bit 4)
             if flags & 0x10:
                 if pos + 1 > len(data):
                     return result
@@ -191,11 +235,20 @@ class ClipboardData:
             return ClipboardData()
 
     def get_hash(self) -> str:
-        """Get SHA256 hash of clipboard content for change detection"""
+        """
+        Generate a hash of clipboard content for change detection.
+
+        Returns a short hash (16 characters) that uniquely identifies this content.
+        Used to avoid sending duplicate clipboard updates.
+        """
         return hashlib.sha256(self.to_bytes()).hexdigest()[:16]
 
     def get_primary_type(self) -> str:
-        """Get the primary content type"""
+        """
+        Get the most important content type present.
+
+        Priority: image > files > html > rtf > text > empty
+        """
         if self.image:
             return "image"
         elif self.files:
@@ -255,17 +308,33 @@ class ClipboardData:
 
 
 class ClipboardHandler:
-    """Cross-platform clipboard handler with rich format support"""
+    """
+    Cross-platform clipboard manager.
+
+    Handles reading and writing clipboard data across different operating systems.
+    Automatically detects what clipboard formats are available on the current platform.
+
+    Features:
+    - Change detection: Can detect when clipboard content changes
+    - Multiple formats: Supports text, images, HTML, RTF, and files
+    - Cross-platform: Works on Windows, macOS, and Linux (with varying capabilities)
+    """
 
     def __init__(self):
         self.last_hash: Optional[str] = None
         self.capabilities = self._detect_capabilities()
 
+        # Log what clipboard features are available
         cap_str = ", ".join(k for k, v in self.capabilities.items() if v)
         print(f"[*] Clipboard capabilities: {cap_str or 'none'}")
 
     def _detect_capabilities(self) -> Dict[str, bool]:
-        """Detect available clipboard capabilities"""
+        """
+        Detect which clipboard features are available on this system.
+
+        Returns:
+            Dictionary mapping feature names to availability
+        """
         return {
             'text': HAS_PYPERCLIP,
             'image': HAS_PIL,
@@ -275,34 +344,43 @@ class ClipboardHandler:
         }
 
     def get_clipboard(self) -> ClipboardData:
-        """Get current clipboard content in all available formats"""
+        """
+        Read current clipboard content in all available formats.
+
+        Attempts to read all supported formats from the system clipboard.
+        Silently ignores errors for individual formats.
+
+        Returns:
+            ClipboardData with all available formats populated
+        """
         data = ClipboardData()
 
-        # Get text (cross-platform)
+        # Get text (works on all platforms)
         if self.capabilities['text']:
             try:
                 text = pyperclip.paste()
                 if text:
                     data.text = text
-            except Exception as e:
+            except Exception:
                 pass  # Silently ignore text errors
 
-        # Get image (cross-platform via PIL)
+        # Get image (works on Windows and macOS with PIL)
         if self.capabilities['image']:
             try:
                 img = ImageGrab.grabclipboard()
                 if img is not None:
                     if isinstance(img, Image.Image):
+                        # Convert to PNG bytes
                         buffer = io.BytesIO()
                         img.save(buffer, format='PNG')
                         data.image = buffer.getvalue()
                     elif isinstance(img, list):
-                        # It's a list of files on some platforms
+                        # On some platforms, returns list of file paths
                         data.files = [str(f) for f in img]
-            except Exception as e:
+            except Exception:
                 pass  # Silently ignore image errors
 
-        # Windows-specific rich formats
+        # Windows-specific rich formats (HTML, RTF, files)
         if HAS_WIN32 and SYSTEM == "Windows":
             try:
                 win32clipboard.OpenClipboard()
@@ -327,7 +405,7 @@ class ClipboardHandler:
                 except:
                     pass
 
-                # File drop (if not already got from PIL)
+                # File drop (if not already retrieved from PIL)
                 if not data.files:
                     try:
                         if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
@@ -347,10 +425,21 @@ class ClipboardHandler:
         return data
 
     def set_clipboard(self, data: ClipboardData) -> bool:
-        """Set clipboard content from ClipboardData"""
+        """
+        Write clipboard data to the system clipboard.
+
+        Attempts to write all formats present in the data.
+        Text has highest priority and is always written first.
+
+        Args:
+            data: ClipboardData to write
+
+        Returns:
+            True if at least one format was written successfully
+        """
         success = False
 
-        # Set text (highest priority, cross-platform)
+        # Set text (highest priority, works everywhere)
         if data.text and self.capabilities['text']:
             try:
                 pyperclip.copy(data.text)
@@ -384,7 +473,7 @@ class ClipboardHandler:
                 except:
                     pass
 
-        # Set rich formats on Windows
+        # Set rich formats on Windows (HTML, RTF)
         if HAS_WIN32 and SYSTEM == "Windows" and (data.html or data.rtf):
             try:
                 win32clipboard.OpenClipboard()
@@ -406,14 +495,19 @@ class ClipboardHandler:
                 except:
                     pass
 
-        # Update hash after setting
+        # Update internal hash after successful write
         if success:
             self.last_hash = data.get_hash()
 
         return success
 
     def has_changed(self) -> bool:
-        """Check if clipboard has changed since last check"""
+        """
+        Check if clipboard has changed since last check.
+
+        Returns:
+            True if clipboard content is different from last time
+        """
         try:
             current = self.get_clipboard()
             if current.is_empty():
@@ -429,7 +523,15 @@ class ClipboardHandler:
             return False
 
     def get_if_changed(self) -> Optional[ClipboardData]:
-        """Get clipboard data only if it has changed"""
+        """
+        Get clipboard data only if it has changed.
+
+        More efficient than calling has_changed() then get_clipboard()
+        because it only reads the clipboard once.
+
+        Returns:
+            ClipboardData if changed, None if unchanged or empty
+        """
         try:
             current = self.get_clipboard()
             if current.is_empty():
@@ -445,5 +547,13 @@ class ClipboardHandler:
             return None
 
     def update_hash(self, data: ClipboardData):
-        """Update the internal hash without checking for changes"""
+        """
+        Update the internal hash without checking for changes.
+
+        Useful when you set the clipboard programmatically and want
+        to avoid triggering a "change" detection on your own update.
+
+        Args:
+            data: ClipboardData to hash and store
+        """
         self.last_hash = data.get_hash()
