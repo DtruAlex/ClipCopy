@@ -3,6 +3,7 @@ pyperclip>=1.8.2      # Cross-platform text clipboard
 Pillow>=10.0.0        # Image clipboard support
 rich>=13.0.0          # Terminal UI
 cryptography>=41.0.0  # Encryption for secure clipboard
+requests>=2.31.0      # HTTP requests for domain verification
 
 # Windows-only (for rich clipboard: HTML, RTF, files)
 pywin32>=306; sys_platform == 'win32'

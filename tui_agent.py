@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Multi-Room Clipboard Sync with Rich TUI.
-Automatic clipboard synchronization across devices.
+Automatic clipboard synchronization across devices with URL security checking.
 
 Usage:
     python tui_agent.py [--host HOST] [--port PORT]
@@ -10,7 +10,14 @@ Commands (in TUI):
     /join <room> <key>  - Join a room with encryption key
     /leave <room>       - Leave a room
     /list               - List all rooms
+    /refresh            - Reconnect to hub (refresh connection)
     /quit               - Exit application
+
+Security Features:
+    - Automatic URL threat detection on incoming clipboard
+    - Typosquatting detection (homoglyphs, Cyrillic lookalikes)
+    - Domain age verification
+    - Blocks dangerous URLs (threat score >= 80)
 """
 import argparse
 import sys
@@ -86,8 +93,8 @@ class ClipboardTUI:
 
     def __init__(self, hub_host: str = '127.0.0.1', hub_port: int = 9999):
         self.console = Console()
-        # Fast polling for real-time feel
-        self.agent = MultiRoomAgent(hub_host, hub_port, poll_interval=0.1)
+        # Fast polling for real-time feel with URL verification enabled
+        self.agent = MultiRoomAgent(hub_host, hub_port, poll_interval=0.1, enable_url_verification=True)
 
         # Event log
         self.events: list = []
@@ -106,12 +113,17 @@ class ClipboardTUI:
         self.cursor_visible = True
         self.last_cursor_toggle = time.time()
 
+        # URL Threat Alert
+        self.current_threat_alert = None  # Stores current threat info for popup
+        self.threat_alert_time = 0  # When the alert was shown
+
         # Setup agent callbacks
         self.agent.on_clipboard_send = self._on_clipboard_send
         self.agent.on_clipboard_receive = self._on_clipboard_receive
         self.agent.on_room_change = self._on_room_change
         self.agent.on_error = self._on_error
         self.agent.on_status_change = self._on_status_change
+        self.agent.on_url_threat = self._on_url_threat
 
     def _add_event(self, message: str, style: str = ""):
         """Add event to the log"""
@@ -161,6 +173,48 @@ class ClipboardTUI:
             self._add_event("✅ Connected to hub", "green")
         elif status == "disconnected":
             self._add_event("🔌 Disconnected from hub", "yellow")
+
+    def _on_url_threat(self, source: str, verification: dict):
+        """Callback when URL threat is detected"""
+        threat_score = verification.get('max_threat_score', 0)
+
+        if threat_score >= 80:
+            emoji = "🔴"
+            style = "red bold"
+            level = "DANGEROUS"
+        elif threat_score >= 50:
+            emoji = "🟠"
+            style = "yellow bold"
+            level = "SUSPICIOUS"
+        else:
+            emoji = "🟡"
+            style = "yellow"
+            level = "QUESTIONABLE"
+
+        # Log the threat
+        self._add_event(
+            f"{emoji} URL THREAT from {source}: {level} (score: {threat_score}/100)",
+            style
+        )
+
+        # Log details about each URL
+        for url_info in verification.get('urls', []):
+            if not url_info.get('safe', True):
+                domain = url_info.get('domain', 'unknown')
+                threats = url_info.get('threats', [])
+                self._add_event(f"  ⚠️  {domain}: {', '.join(threats)}", "yellow")
+
+        # Store threat for popup display
+        self.current_threat_alert = {
+            'source': source,
+            'level': level,
+            'emoji': emoji,
+            'score': threat_score,
+            'verification': verification,
+            'time': time.time()
+        }
+        self.threat_alert_time = time.time()
+        self._add_event(f"  ⚠️  {domain}: {', '.join(threats)}", "yellow")
 
     def _create_header(self) -> Panel:
         """Create the header panel"""
@@ -267,12 +321,82 @@ class ClipboardTUI:
         text.append("\n", style="default")
 
         # Compact command reference
-        text.append("/join <room> <key>  /leave <room>  /list  /quit", style="dim cyan")
+        text.append("/join <room> <key>  /leave <room>  /list  /refresh  /quit", style="dim cyan")
 
         return Panel(text, title="💡 Command", border_style="blue", padding=(0, 1))
 
+    def _create_threat_alert_panel(self) -> Optional[Panel]:
+        """Create a prominent threat alert popup panel"""
+        if not self.current_threat_alert:
+            return None
+
+        # Auto-dismiss after 10 seconds
+        if time.time() - self.threat_alert_time > 10:
+            self.current_threat_alert = None
+            return None
+
+        alert = self.current_threat_alert
+        text = Text()
+
+        # Header with emoji and level
+        text.append(f"\n{alert['emoji']} ", style="bold")
+        text.append(f"URL THREAT DETECTED: {alert['level']}\n", style="bold red")
+        text.append("="*60 + "\n", style="red")
+
+        # Score
+        text.append(f"Threat Score: {alert['score']}/100", style="bold yellow")
+        text.append(f" from {alert['source']}\n\n", style="cyan")
+
+        # Details about each threatening URL
+        for url_info in alert['verification'].get('urls', []):
+            if not url_info.get('safe', True):
+                domain = url_info.get('domain', 'unknown')
+                url = url_info.get('url', domain)
+
+                text.append("🔗 ", style="red")
+                text.append(f"{url}\n", style="bold white")
+                text.append(f"   Domain: {domain}\n", style="yellow")
+
+                threats = url_info.get('threats', [])
+                if threats:
+                    text.append("   Threats:\n", style="red")
+                    for threat in threats:
+                        text.append(f"   • {threat}\n", style="yellow")
+
+        text.append("\n" + "="*60 + "\n", style="red")
+
+        # Action taken
+        if alert['score'] >= 80:
+            text.append("🛑 CLIPBOARD BLOCKED", style="bold red blink")
+            text.append(" - Content was NOT copied\n", style="red")
+        else:
+            text.append("⚠️  WARNING", style="bold yellow")
+            text.append(" - Be careful with this content\n", style="yellow")
+
+        text.append("\nPress any key to dismiss...", style="dim")
+
+        # Create panel with attention-grabbing border
+        border_style = "red bold" if alert['score'] >= 80 else "yellow bold"
+        return Panel(
+            text,
+            title=f"⚠️  SECURITY ALERT ⚠️",
+            border_style=border_style,
+            padding=(1, 2),
+            style="on red" if alert['score'] >= 80 else "on yellow"
+        )
+
     def _create_layout(self) -> Layout:
         """Create the full TUI layout"""
+        # Check if we should show threat alert
+        threat_panel = self._create_threat_alert_panel()
+
+        if threat_panel:
+            # Show threat alert as main content (overlay everything)
+            layout = Layout()
+            layout.update(threat_panel)
+            return layout
+
+        # Normal layout
         layout = Layout()
 
         # Main structure - more compact
@@ -328,6 +452,22 @@ class ClipboardTUI:
             else:
                 self._add_event("📋 No rooms joined yet")
 
+        elif command == '/refresh':
+            # Reconnect to hub
+            self._add_event("🔄 Refreshing connection to hub...")
+            try:
+                # Stop current agent
+                self.agent.stop()
+                time.sleep(0.5)  # Give it time to clean up
+
+                # Restart agent
+                if self.agent.start():
+                    self._add_event("✅ Reconnected to hub successfully", "green")
+                else:
+                    self._add_event("❌ Failed to reconnect to hub", "red")
+            except Exception as e:
+                self._add_event(f"❌ Error reconnecting: {e}", "red")
+
         elif command == '/quit' or command == '/exit' or command == '/q':
             self.running = False
 
@@ -343,6 +483,11 @@ class ClipboardTUI:
                 char = get_key()
 
                 if char is None:
+                    continue
+
+                # If threat alert is showing, any key dismisses it
+                if self.current_threat_alert:
+                    self.current_threat_alert = None
                     continue
 
                 # Check for Ctrl+C -> Exit
