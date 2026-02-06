@@ -214,7 +214,6 @@ class ClipboardTUI:
             'time': time.time()
         }
         self.threat_alert_time = time.time()
-        self._add_event(f"  ⚠️  {domain}: {', '.join(threats)}", "yellow")
 
     def _create_header(self) -> Panel:
         """Create the header panel"""
@@ -285,8 +284,20 @@ class ClipboardTUI:
                 text.append(f" from {self.current_clipboard_source}", style="magenta")
 
             text.append("\n")
-            preview = self.current_clipboard.get_preview(60)
-            text.append(preview, style="white")
+
+            # Show full content instead of truncated preview
+            # Use raw text if available to show "everything"
+            if hasattr(self.current_clipboard, 'text') and self.current_clipboard.text:
+                full_text = self.current_clipboard.text
+                # Safety capability limit for TUI performance (5000 chars approx 1-2 pages)
+                if len(full_text) > 5000:
+                    text.append(full_text[:5000] + "\n... [Content truncated for display performance]", style="white")
+                else:
+                    text.append(full_text, style="white")
+            else:
+                # Fallback for binary/image data
+                preview = self.current_clipboard.get_preview(100)
+                text.append(preview, style="white")
         else:
             text.append("Copy to start syncing", style="dim italic")
 
@@ -297,8 +308,18 @@ class ClipboardTUI:
         if not self.events:
             content = Text("Waiting for activity...", style="dim")
         else:
-            # Show fewer events to fit screen
-            recent_events = self.events[-15:]
+            # Dynamic height calculation to allow scrolling/filling the view
+            # Layout structure:
+            # Header(3) + Footer(4) = 7 lines fixed
+            # Body takes remainder. Right side split 50/50 between Activity and Clipboard.
+
+            term_height = self.console.height
+            body_height = term_height - 7
+            # Activity gets half of body. Subtract 2 for panel borders.
+            available_lines = max(5, (body_height // 2) - 2)
+
+            # Show strictly the number of events that fit
+            recent_events = self.events[-available_lines:]
             content = Text.from_markup("\n".join(recent_events))
 
         return Panel(content, title="📊 Activity", border_style="yellow", padding=(0, 1))

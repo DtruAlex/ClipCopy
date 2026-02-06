@@ -35,9 +35,5 @@ USER cliphub
 # Expose port
 EXPOSE 9999
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD python -c "import socket; s=socket.socket(); s.settimeout(3); s.connect(('127.0.0.1', 9999)); s.close()" || exit 1
-
 # Run the hub
 CMD ["python", "-u", "ClipHub.py"]

@@ -23,6 +23,13 @@ from ClipProtocol import ClipProtocol, PacketType
 from clipboard_handler import ClipboardHandler, ClipboardData
 from utils import SecurityEngine
 
+# Optional URL verification
+try:
+    from url_verifier import URLVerifier, format_verification_warning
+    HAS_URL_VERIFICATION = True
+except ImportError:
+    HAS_URL_VERIFICATION = False
+
 
 @dataclass
 class RoomContext:
@@ -66,8 +73,8 @@ class MultiRoomAgent:
     - This prevents infinite loops of clipboard updates
     """
 
-    def __init__(self, hub_host: str = '127.0.0.1', hub_port: int = 9999,
-                 poll_interval: float = 0.1):
+    def __init__(self, hub_host: str = 'clipcopy-server.azurewebsites.net', hub_port: int = 9999,
+                 poll_interval: float = 0.1, enable_url_verification: bool = True):
         """
         Initialize the clipboard agent.
 
@@ -75,10 +82,20 @@ class MultiRoomAgent:
             hub_host: IP address or hostname of the hub server
             hub_port: Port number the hub is listening on
             poll_interval: How often to check clipboard (seconds, default 0.1 = 100ms)
+            enable_url_verification: Enable URL security scanning (default: True)
         """
         self.hub_host = hub_host
         self.hub_port = hub_port
         self.poll_interval = poll_interval
+
+        # URL verification settings
+        self.enable_url_verification = enable_url_verification and HAS_URL_VERIFICATION
+        if enable_url_verification and not HAS_URL_VERIFICATION:
+            print("[!] URL verification requested but modules not available")
+            print("[!] Install with: pip install requests")
+        elif self.enable_url_verification:
+            print("[✓] URL security verification: ENABLED")
+            print("[✓] Clipboard will be scanned for malicious URLs")
 
         # Network connection
         self.sock: Optional[socket.socket] = None
@@ -106,6 +123,7 @@ class MultiRoomAgent:
         self.on_room_change: Optional[Callable[[str, str], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
         self.on_status_change: Optional[Callable[[str], None]] = None
+        self.on_url_threat: Optional[Callable[[str, Dict], None]] = None  # New callback for URL threats
 
     def connect(self) -> bool:
         """
@@ -308,6 +326,25 @@ class MultiRoomAgent:
                         time.sleep(self.poll_interval)
                         continue
 
+                    # URL Security Check before sending
+                    if self.enable_url_verification and clipboard_data.text and HAS_URL_VERIFICATION:
+                        try:
+                            verification = URLVerifier.verify_text(clipboard_data.text)
+                            if verification['has_threats']:
+                                # Log warning (non-blocking)
+                                warning_msg = format_verification_warning(verification)
+                                print(f"\n⚠️  WARNING: Sending clipboard with suspicious URLs")
+                                print(f"Threat score: {verification['max_threat_score']}/100\n")
+
+                                # Notify callback
+                                if self.on_url_threat:
+                                    self.on_url_threat("outgoing", verification)
+                        except Exception as e:
+                            # Don't fail if URL verification has issues
+                            print(f"[!] URL verification error on send: {e}")
+                            import traceback
+                            traceback.print_exc()
+
                     # Send to all joined rooms
                     with self.lock:
                         for room_name, room_ctx in list(self.rooms.items()):
@@ -447,6 +484,36 @@ class MultiRoomAgent:
 
                         if clipboard_data.is_empty():
                             continue
+
+                        # Step 2.5: URL Security Verification
+                        if self.enable_url_verification and clipboard_data.text and HAS_URL_VERIFICATION:
+                            try:
+                                verification = URLVerifier.verify_text(clipboard_data.text)
+                                if verification['has_threats']:
+                                    # Found suspicious URLs
+                                    warning_msg = format_verification_warning(verification)
+
+                                    # Log warning
+                                    if self.on_error:
+                                        self.on_error(f"⚠️  URL THREAT DETECTED in clipboard from room '{room_name}'")
+
+                                    # Notify via callback
+                                    if self.on_url_threat:
+                                        self.on_url_threat(room_name, verification)
+
+                                    # Print warning to console
+                                    print(f"\n{warning_msg}\n")
+
+                                    # Optional: Block dangerous URLs (score >= 80)
+                                    if verification['max_threat_score'] >= 80:
+                                        print(f"[!] BLOCKING dangerous clipboard content from room '{room_name}'")
+                                        print(f"[!] Threat score: {verification['max_threat_score']}/100")
+                                        continue  # Skip updating clipboard
+                            except Exception as e:
+                                # Don't fail if URL verification has issues
+                                print(f"[!] URL verification error: {e}")
+                                import traceback
+                                traceback.print_exc()
 
                         # Step 3: Track hash to prevent echo
                         current_hash = clipboard_data.get_hash()
