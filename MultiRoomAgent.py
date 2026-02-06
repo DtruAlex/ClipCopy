@@ -73,7 +73,7 @@ class MultiRoomAgent:
     - This prevents infinite loops of clipboard updates
     """
 
-    def __init__(self, hub_host: str = 'clipcopy-server.azurewebsites.net', hub_port: int = 9999,
+    def __init__(self, hub_host: str = '20.105.216.52', hub_port: int = 9999,
                  poll_interval: float = 0.1, enable_url_verification: bool = True):
         """
         Initialize the clipboard agent.

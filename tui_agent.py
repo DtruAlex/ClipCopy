@@ -90,8 +90,8 @@ from clipboard_handler import ClipboardData
 
 class ClipboardTUI:
     """Terminal UI for multi-room clipboard sync"""
-
-    def __init__(self, hub_host: str = '127.0.0.1', hub_port: int = 9999):
+#20.105.216.52'
+    def __init__(self, hub_host: str = 'clipcopy-server.azurewebsites.net', hub_port: int = 9999):
         self.console = Console()
         # Fast polling for real-time feel with URL verification enabled
         self.agent = MultiRoomAgent(hub_host, hub_port, poll_interval=0.1, enable_url_verification=True)
@@ -593,7 +593,7 @@ In the TUI:
   /quit                      # Exit
         """
     )
-    parser.add_argument('--host', default='127.0.0.1', help='Hub server host (default: 127.0.0.1)')
+    parser.add_argument('--host', default='clipcopy-server.azurewebsites.net', help='Hub server host (default: 127.0.0.1)')
     parser.add_argument('--port', type=int, default=9999, help='Hub server port (default: 9999)')
 
     args = parser.parse_args()
