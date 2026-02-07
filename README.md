@@ -4,6 +4,57 @@ Secure, real-time clipboard synchronization across multiple devices. Copy on one
 
 ---
 
+## Quick Start Guide
+
+Get up and running in 3 minutes:
+
+### Step 1: Install
+```bash
+# macOS/Linux
+./install.sh
+
+# Windows
+install.bat
+```
+
+### Step 2: Start the Hub Server (on one machine)
+```bash
+python ClipHub.py
+```
+Leave this running. This is the relay server that connects your devices.
+
+### Step 3: Start the Client (on each device)
+```bash
+# macOS/Linux
+./start_agent.sh
+
+# Windows
+start_clipboard_sync.bat
+```
+
+### Step 4: Join a Room
+In the client interface, type:
+```
+/join myroom MySecretPassword123
+```
+Use the **same room name and password** on all devices you want to sync.
+
+### Step 5: Copy & Paste!
+- Copy something on Device A (`Ctrl+C` / `Cmd+C`)
+- Paste on Device B (`Ctrl+V` / `Cmd+V`)
+
+That's it! Your clipboard is now synced.
+
+### Quick Commands Reference
+| Command | What it does |
+|---------|--------------|
+| `/join <room> <password>` | Connect to a sync room |
+| `/leave <room>` | Disconnect from a room |
+| `/list` | Show active rooms |
+| `/quit` | Exit the application |
+
+---
+
 ## Table of Contents
 1. [Overview](#overview)
 2. [Installation](#installation)
