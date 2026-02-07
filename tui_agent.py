@@ -593,7 +593,7 @@ In the TUI:
   /quit                      # Exit
         """
     )
-    parser.add_argument('--host', default='clipcopy-server.azurewebsites.net', help='Hub server host (default: 127.0.0.1)')
+    parser.add_argument('--host', default='clipcopy.purplegrass-092e5422.westeurope.azurecontainerapps.io', help='Hub server host (default: 127.0.0.1)')
     parser.add_argument('--port', type=int, default=9999, help='Hub server port (default: 9999)')
 
     args = parser.parse_args()
